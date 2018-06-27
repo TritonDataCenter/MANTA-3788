@@ -2,6 +2,11 @@
 
 /*
  * procdata.js: process a data file.  See MANTA-3788 for context.
+ *
+ * TODO:
+ * - See TODOs and XXXs
+ * - Add GNUplot outputter
+ * - Load new data and try plotting it
  */
 
 var mod_assertplus = require('assert-plus');
@@ -9,6 +14,7 @@ var mod_cmdutil = require('cmdutil');
 var mod_fs = require('fs');
 var mod_jsprim = require('jsprim');
 var mod_lstream = require('lstream');
+var mod_progbar = require('progbar');
 var mod_stream = require('stream');
 var mod_util = require('util');
 var mod_vasync = require('vasync');
@@ -19,12 +25,16 @@ var VError = require('verror');
 var NRELATIONS_MAX = 100;
 /* maximum size of PostgreSQL table data files */
 var PG_FILE_MAX = 1024 * 1024 * 1024;
+/* fraction of data points to sample (1/N) */
+var NDATAPOINTS_SKIP = 100 * 1000;
+// var NDATAPOINTS_SKIP = 1000;
 
 function main()
 {
 	var argv;
 	var relmapfile, datafile;
 	var relnames;
+	var baropts;
 
 	mod_cmdutil.configure({
 	    'synopses': [ 'REL_MAP_FILE DATA_FILE' ],
@@ -74,19 +84,39 @@ function main()
 		parser.on('finish', callback);
 	    },
 
+	    function loadDataFileSize(callback) {
+		baropts = {
+		    'filename': datafile
+		};
+		mod_fs.stat(datafile, function (err, st) {
+			if (err || !st.isFile()) {
+				baropts.nosize = true;
+			} else {
+				baropts.size = st.size;
+			}
+			callback();
+		});
+	    },
+
 	    function processData(callback) {
-		var fstream, lstream, parser, serializer;
+		var fstream, bstream, lstream, parser, serializer, bar;
+
+		bar = new mod_progbar.ProgressBar(baropts);
+		bar.advance(0);
 
 		fstream = mod_vstream.wrapStream(
 		    mod_fs.createReadStream(datafile), datafile);
+		bstream = bar.stream();
 		lstream = mod_vstream.wrapTransform(
 		    new mod_lstream(), 'line separator');
 		parser = new DataFileParser({
 		    'relnames': relnames
 		});
-		serializer = new JsonSerializer({});
+		// serializer = new JsonSerializer({});
+		serializer = new GnuplotEmitter({});
 
-		fstream.pipe(lstream);
+		fstream.pipe(bstream);
+		bstream.pipe(lstream);
 		lstream.pipe(parser);
 
 		/* TODO */
@@ -516,6 +546,92 @@ JsonSerializer.prototype._transform = function (chunk, _, callback)
 	}
 
 	this.push(str);
+};
+
+
+/*
+ * Outputs raw data into a GNUplot file that plots file offsets.
+ */
+function GnuplotEmitter(options)
+{
+	var streamOptions;
+
+	mod_assertplus.object(options, 'options');
+	streamOptions = mod_jsprim.mergeObjects(options.streamOptions,
+	    { 'objectMode': true }, { 'highWaterMark': 1024 });
+	mod_stream.Transform.call(this, streamOptions);
+	mod_vstream.wrapTransform(this, this.constructor.name);
+
+	this.ge_init = false;
+	this.ge_samplei = 0;
+}
+
+mod_util.inherits(GnuplotEmitter, mod_stream.Transform);
+
+GnuplotEmitter.prototype.init = function ()
+{
+	this.push([
+	    '#',
+	    '# This is a GNUplot input file generated automatically by ',
+	    '# procdata.js.',
+	    '#',
+	    'set terminal png size 1200,600',
+	    'set title "Autovacuum: file offsets"',
+	    '',
+	    'set xdata time',
+	    'set timefmt "%s"',
+	    'set format x "%m/%d\\n%H:%M:%SZ"',
+	    '',
+	    '# Add 10% padding at the top of the graph.',
+	    'set offsets graph 0, 0, 0.1, 0',
+	    '# The y-axis should always start at zero.',
+	    'set yrange [0:*]',
+	    'set ylabel "Count"',
+	    'set ytics',
+	    'plot "-" using 1:2 with points title "read offsets (different files)"',
+	    ''
+	].join('\n'));
+};
+
+GnuplotEmitter.prototype._transform = function (chunk, _, callback)
+{
+	/*
+	 * XXX This should go in the constructor.  Need to understand why that
+	 * results in an assertion failure in vstream (because there's no
+	 * context).
+	 */
+	if (!this.ge_init) {
+		this.ge_init = true;
+		this.init();
+	}
+
+	/* We always complete immediately without error. */
+	setImmediate(callback);
+
+	// if (!chunk.isRead) {
+	if (chunk.isRead) {
+		return;
+	}
+
+	/*
+	 * Initially, we'll filter pretty aggressively.  We'll probably want to
+	 * incorporate some of these. TODO
+	 */
+	if (chunk.size != 8192 || chunk.relname === null ||
+	    chunk.logicalOffset === null) {
+		return;
+	}
+
+	/*
+	 * Sample to avoid creating quite so many data points.
+	 */
+	if (this.ge_samplei++ % NDATAPOINTS_SKIP !== 0) {
+		return;
+	}
+
+	mod_assertplus.notStrictEqual(chunk.offset, null);
+	this.push('\t' + Math.floor(chunk.walltime.getTime() / 1000) + ' ' +
+	    chunk.offset + '\n');
 };
 
 main();
