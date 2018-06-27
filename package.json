@@ -1,0 +1,18 @@
+{
+	"name": "manta-3788",
+	"version": "1.0.0",
+	"bin": {
+		"manta-3788": "procdata.js"
+	},
+	"dependencies": {
+		"assert-plus": "^1.0.0",
+		"cmdutil": "^1.1.0",
+		"lstream": "^0.0.4",
+		"jsprim": "^2.0.0",
+		"posix-getopt": "^1.2.0",
+		"verror": "^1.10.0",
+		"vstream": "^0.1.0",
+		"progbar": "^1.2.0",
+		"vasync": "^2.2.0"
+	}
+}
