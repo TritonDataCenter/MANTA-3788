@@ -26,7 +26,7 @@ var NRELATIONS_MAX = 100;
 /* maximum size of PostgreSQL table data files */
 var PG_FILE_MAX = 1024 * 1024 * 1024;
 /* fraction of data points to sample (1/N) */
-var NDATAPOINTS_SKIP = 100 * 1000;
+var NDATAPOINTS_SKIP = 10 * 1000;
 // var NDATAPOINTS_SKIP = 1000;
 
 function main()
@@ -35,6 +35,7 @@ function main()
 	var relmapfile, datafile;
 	var relnames;
 	var baropts;
+	var readfile, writefile;
 
 	mod_cmdutil.configure({
 	    'synopses': [ 'REL_MAP_FILE DATA_FILE' ],
@@ -49,6 +50,9 @@ function main()
 	relmapfile = argv[0];
 	datafile = argv[1];
 	relnames = new RelNameCollector({});
+
+	readfile = datafile + '_reads';
+	writefile = datafile + '_writes';
 
 	mod_vasync.waterfall([
 	    function loadRelMapFile(callback) {
@@ -112,16 +116,36 @@ function main()
 		parser = new DataFileParser({
 		    'relnames': relnames
 		});
-		// serializer = new JsonSerializer({});
-		serializer = new GnuplotEmitter({});
+
+		serializer_reads = new GnuplotEmitter({
+		    'outDatafile': readfile + '.tmp',
+		    'skipSamples': NDATAPOINTS_SKIP,
+		    'filters': [
+			function isReadOperation(datapoint) {
+				mod_assertplus.bool(datapoint.isRead);
+				return (datapoint.isRead);
+			}
+		    ]
+		});
+
+		serializer_writes = new GnuplotEmitter({
+		    'outDatafile': writefile + '.tmp',
+		    'skipSamples': NDATAPOINTS_SKIP,
+		    'filters': [
+			function isWriteOperation(datapoint) {
+				mod_assertplus.bool(datapoint.isRead);
+				return (!datapoint.isRead);
+			}
+		    ]
+		});
 
 		fstream.pipe(bstream);
 		bstream.pipe(lstream);
 		lstream.pipe(parser);
 
 		/* TODO */
-		parser.pipe(serializer);
-		serializer.pipe(process.stdout);
+		parser.pipe(serializer_reads);
+		parser.pipe(serializer_writes);
 
 		parser.on('warn', function (context, kind, error) {
 			mod_cmdutil.warn('%s: %s', context !== null ?
@@ -130,6 +154,14 @@ function main()
 		});
 
 		parser.on('finish', callback);
+	    },
+
+	    function linkReadFile(callback) {
+	    	mod_fs.rename(readfile + '.tmp', readfile, callback);
+	    },
+
+	    function linkWriteFile(callback) {
+	    	mod_fs.rename(writefile + '.tmp', writefile, callback);
 	    }
 	], function (err) {
 		if (err) {
@@ -552,70 +584,50 @@ JsonSerializer.prototype._transform = function (chunk, _, callback)
 /*
  * Outputs raw data into a GNUplot file that plots file offsets.
  */
-function GnuplotEmitter(options)
+function GnuplotEmitter(args)
 {
 	var streamOptions;
 
-	mod_assertplus.object(options, 'options');
-	streamOptions = mod_jsprim.mergeObjects(options.streamOptions,
+	mod_assertplus.object(args, 'args');
+	mod_assertplus.number(args.skipSamples, 'args.skipSamples');
+	mod_assertplus.string(args.outDatafile, 'args.outDatafile');
+	mod_assertplus.arrayOfFunc(args.filters, 'args.filters');
+
+	streamOptions = mod_jsprim.mergeObjects(args.streamOptions,
 	    { 'objectMode': true }, { 'highWaterMark': 1024 });
 	mod_stream.Transform.call(this, streamOptions);
-	mod_vstream.wrapTransform(this, this.constructor.name);
+	mod_vstream.wrapStream(this, this.constructor.name);
 
-	this.ge_init = false;
+	this.ge_filters = args.filters.slice(0);
+	this.ge_outfile_name = args.outDatafile;
+	this.ge_outfile_stream = mod_fs.createWriteStream(this.ge_outfile_name);
+	this.ge_sample_skip = args.skipSamples;
+
 	this.ge_samplei = 0;
+
+	/* XXX a little janky */
+	this.pipe(this.ge_outfile_stream);
 }
 
 mod_util.inherits(GnuplotEmitter, mod_stream.Transform);
 
-GnuplotEmitter.prototype.init = function ()
-{
-	this.push([
-	    '#',
-	    '# This is a GNUplot input file generated automatically by ',
-	    '# procdata.js.',
-	    '#',
-	    'set terminal png size 1200,600',
-	    'set title "Autovacuum: file offsets"',
-	    '',
-	    'set xdata time',
-	    'set timefmt "%s"',
-	    'set format x "%m/%d\\n%H:%M:%SZ"',
-	    '',
-	    '# Add 10% padding at the top of the graph.',
-	    'set offsets graph 0, 0, 0.1, 0',
-	    '# The y-axis should always start at zero.',
-	    'set yrange [0:*]',
-	    'set ylabel "Count"',
-	    'set ytics',
-	    'plot "-" using 1:2 with points title "read offsets (different files)"',
-	    ''
-	].join('\n'));
-};
-
 GnuplotEmitter.prototype._transform = function (chunk, _, callback)
 {
-	/*
-	 * XXX This should go in the constructor.  Need to understand why that
-	 * results in an assertion failure in vstream (because there's no
-	 * context).
-	 */
-	if (!this.ge_init) {
-		this.ge_init = true;
-		this.init();
-	}
+	var i, f;
 
 	/* We always complete immediately without error. */
 	setImmediate(callback);
 
-	// if (!chunk.isRead) {
-	if (chunk.isRead) {
-		return;
+	for (i = 0; i < this.ge_filters.length; i++) {
+		f = this.ge_filters[i];
+		if (!f(chunk)) {
+			return;
+		}
 	}
 
 	/*
 	 * Initially, we'll filter pretty aggressively.  We'll probably want to
-	 * incorporate some of these. TODO
+	 * incorporate some of these data points, though. TODO
 	 */
 	if (chunk.size != 8192 || chunk.relname === null ||
 	    chunk.logicalOffset === null) {
@@ -625,7 +637,7 @@ GnuplotEmitter.prototype._transform = function (chunk, _, callback)
 	/*
 	 * Sample to avoid creating quite so many data points.
 	 */
-	if (this.ge_samplei++ % NDATAPOINTS_SKIP !== 0) {
+	if (this.ge_samplei++ % this.ge_sample_skip !== 0) {
 		return;
 	}
 
